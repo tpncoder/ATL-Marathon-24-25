@@ -1,142 +1,105 @@
 import ee
-import requests
-import rasterio
-import pandas as pd
-import numpy as np
-from matplotlib import pyplot as plt
+from rainfall import get_rainfall_data
+from scs_runoff import calculate_scs_runoff
 
-# Initialize the Earth Engine library
+# Initialize Earth Engine
 ee.Authenticate()
 ee.Initialize(project="ee-floodbuddy")
 
-# Define coordinates and radius for area of interest
-latitude = 37.7749  # Replace with your latitude
-longitude = -122.4194  # Replace with your longitude
-radius = 50000  # Radius in meters (50 km)
+latitude = 37.7749
+longitude = -122.4194
+radius = 50000
 
-# Define the center and region in Google Earth Engine
-center_point = ee.Geometry.Point([longitude, latitude])
-region = center_point.buffer(radius)  # Create a buffer around the point
+# Define region
+region = ee.Geometry.Point([longitude, latitude]).buffer(radius)
 
-# Load the SRTM DEM dataset and clip to the region
-dem_dataset = ee.Image("USGS/SRTMGL1_003")
-dem_clip = dem_dataset.clip(region)
+# Processing DEM data
+print("Processing DEM data...")
+dem = ee.Image("USGS/SRTMGL1_003").clip(region)
+slope = ee.Terrain.slope(dem).reduceRegion(
+    reducer=ee.Reducer.mean(),
+    geometry=region,
+    scale=30,
+    maxPixels=1e9
+).getInfo().get("slope", 0)
 
-# Generate the download URL for the DEM
-url = dem_clip.getDownloadURL({
-    'scale': 30,
-    'region': region,
-    'format': 'GeoTIFF'
-})
+print(f"Mean Slope: {slope} degrees")
 
-# Define local path for saving the DEM
-export_path = './dem_data.tif'
-
-# Download the DEM data and save it to the local path
-print("Downloading DEM data...")
-response = requests.get(url)
-if response.status_code == 200:
-    with open(export_path, 'wb') as file:
-        file.write(response.content)
-    print(f"DEM downloaded to {export_path}")
-else:
-    print("Failed to download DEM data.")
-
-# Load soil data
+# Fetching soil data
 print("Fetching soil data...")
+soil_data = ee.Image("OpenLandMap/SOL/SOL_TEXTURE-CLASS_USDA-TT_M/v02").clip(region)
+soil_texture = soil_data.reduceRegion(
+    reducer=ee.Reducer.mode(),
+    geometry=region,
+    scale=250,
+    maxPixels=1e9
+).getInfo().get("b0", None)
+
+print(f"Soil Texture: {soil_texture}")
+
+# Fetching vegetation data
+print("Fetching vegetation data...")
+vegetation = ee.ImageCollection("MODIS/061/MOD13A1").filterDate("2022-01-01", "2022-12-31").mean().select("NDVI").clip(region)
+ndvi = vegetation.reduceRegion(
+    reducer=ee.Reducer.mean(),
+    geometry=region,
+    scale=250,
+    maxPixels=1e9
+).getInfo().get("NDVI", 0)
+
+print(f"Mean NDVI: {ndvi}")
+
+# Fetching historical rainfall data
+print("Fetching historical rainfall data...")
+rainfall_data = get_rainfall_data(latitude, longitude, radius, "2022-01-01", "2022-12-31")
+mean_precipitation = rainfall_data.get("precipitation", 0)
+print(f"Mean Precipitation: {mean_precipitation} mm")
+
+# Estimate Curve Number (CN)
+# Adjust the curve number dynamically using slope, soil, and NDVI
+if soil_texture and ndvi:
+    if soil_texture < 5:  # Sandy soils
+        curve_number = 65
+    elif soil_texture < 7:  # Loamy soils
+        curve_number = 75
+    else:  # Clayey soils
+        curve_number = 85
+
+    if slope > 10:  # Steep slopes
+        curve_number += 5
+    elif slope < 2:  # Flat terrain
+        curve_number -= 5
+else:
+    curve_number = 75  # Default value
+
+# Calculate SCS runoff
+runoff = calculate_scs_runoff(mean_precipitation, curve_number)
+print(f"Runoff using SCS Curve Number method: {runoff} mm")
+
+# Fetch historical runoff data
+print("Fetching historical runoff data...")
+runoff_dataset = "NASA/GLDAS/V021/NOAH/G025/T3H"  # Verify this path in Earth Engine catalog
 try:
-    soil_data = ee.Image("ISRIC/SoilGrids250m/phy_properties").select(["clay", "sand", "soc"])
-    soil_clip = soil_data.clip(region)
-    soil_url = soil_clip.getDownloadURL({'scale': 250, 'region': region, 'format': 'GeoTIFF'})
-    soil_path = './soil_data.tif'
+    runoff_data = ee.ImageCollection(runoff_dataset).filterDate("2022-01-01", "2022-12-31").select("Qs_acc").mean()
+    historical_runoff = runoff_data.reduceRegion(
+        reducer=ee.Reducer.mean(),
+        geometry=region,
+        scale=1000,
+        maxPixels=1e9
+    ).getInfo().get("Qs_acc", None)
 
-    response = requests.get(soil_url)
-    if response.status_code == 200:
-        with open(soil_path, 'wb') as file:
-            file.write(response.content)
-        print(f"Soil data downloaded to {soil_path}")
+    if historical_runoff is not None:
+        historical_runoff_mm = historical_runoff * 1000  # Convert from meters to mm
+        print(f"Historical Runoff (mm): {historical_runoff_mm}")
     else:
-        print("Failed to download soil data.")
-except Exception as e:
-    print("Error fetching soil data:", e)
+        print("No historical runoff data found.")
+except ee.ee_exception.EEException as e:
+    print(f"Error fetching historical runoff data: {e}")
+    historical_runoff_mm = None
 
-# Read DEM data
-print("Opening and analyzing DEM data...")
-with rasterio.open(export_path) as dem:
-    dem_data = dem.read(1)
-    data_flat = dem_data[dem_data != dem.nodata]  # Exclude nodata values
-
-# Define a function to fetch historical and future rainfall data
-def fetch_rainfall_data(lat, lon):
-    historical_rainfall = 253.12  # Placeholder for actual historical data
-    future_rainfall = 124.35  # Placeholder for actual forecast data
-    return historical_rainfall, future_rainfall
-
-# Use rainfall data for runoff calculations
-historical_rainfall, future_rainfall = fetch_rainfall_data(latitude, longitude)
-print(f"\nHistorical Rainfall (mm): {historical_rainfall}")
-print(f"Predicted Future Rainfall (mm): {future_rainfall}")
-
-# Calculate runoff using DEM, soil properties, and rainfall data
-soil_properties = {"clay_content": 30, "sand_content": 40, "soc_content": 1.5}  # Sample soil values
-
-def calculate_runoff(dem_data, rainfall, soil_properties):
-    elevation_diff = dem_data.max() - dem_data.min()
-    runoff = (rainfall / (elevation_diff * (soil_properties["clay_content"] + soil_properties["sand_content"])))
-    return runoff
-
-historical_runoff = calculate_runoff(dem_data, historical_rainfall, soil_properties)
-future_runoff = calculate_runoff(dem_data, future_rainfall, soil_properties)
-
-accuracy = 100 - abs((historical_runoff - future_runoff) / historical_runoff * 100)
-print(f"\nHistorical Runoff: {historical_runoff:.2f} mm")
-print(f"Predicted Runoff: {future_runoff:.2f} mm")
-print(f"Accuracy of Prediction: {accuracy:.2f}%")
-
-# Display table of high runoff areas
-high_runoff_areas = [
-    {"Latitude": latitude + 0.01, "Longitude": longitude + 0.01, "Rainfall (mm)": future_rainfall, "Water Level Rise": future_runoff},
-    {"Latitude": latitude - 0.01, "Longitude": longitude - 0.01, "Rainfall (mm)": historical_rainfall, "Water Level Rise": historical_runoff}
-]
-runoff_df = pd.DataFrame(high_runoff_areas)
-print("\nHigh Runoff Areas:")
-print(runoff_df)
-
-# Function to calculate spatial runoff for DEM data
-def calculate_spatial_runoff(dem_data, rainfall, soil_properties):
-    # Normalize elevation difference
-    elevation_diff = np.ptp(dem_data)  # Range (max - min) of elevation
-    runoff = (rainfall / (elevation_diff * (soil_properties["clay_content"] + soil_properties["sand_content"])))
-    spatial_runoff = dem_data * runoff  # Scale runoff based on elevation
-    return spatial_runoff
-
-# Calculate spatial runoff for historical and predicted rainfall
-historical_spatial_runoff = calculate_spatial_runoff(dem_data, historical_rainfall, soil_properties)
-future_spatial_runoff = calculate_spatial_runoff(dem_data, future_rainfall, soil_properties)
-
-# Normalize runoff values for better visualization
-historical_spatial_runoff_normalized = (historical_spatial_runoff - np.min(historical_spatial_runoff)) / \
-                                       (np.max(historical_spatial_runoff) - np.min(historical_spatial_runoff))
-future_spatial_runoff_normalized = (future_spatial_runoff - np.min(future_spatial_runoff)) / \
-                                   (np.max(future_spatial_runoff) - np.min(future_spatial_runoff))
-
-# Plotting DEM runoff comparison
-fig, axs = plt.subplots(1, 2, figsize=(12, 6))
-
-# Historical runoff
-axs[0].imshow(historical_spatial_runoff_normalized, cmap='Blues')
-axs[0].set_title("Historical Rainwater Runoff")
-axs[0].axis('off')  # Hide axis for cleaner visualization
-axs[0].colorbar = plt.colorbar(axs[0].imshow(historical_spatial_runoff_normalized, cmap='Blues'),
-                               ax=axs[0], orientation='vertical', label="Runoff Intensity")
-
-# Predicted runoff
-axs[1].imshow(future_spatial_runoff_normalized, cmap='Greens')
-axs[1].set_title("Predicted Rainwater Runoff")
-axs[1].axis('off')
-axs[1].colorbar = plt.colorbar(axs[1].imshow(future_spatial_runoff_normalized, cmap='Greens'),
-                               ax=axs[1], orientation='vertical', label="Runoff Intensity")
-
-plt.tight_layout()
-plt.show()
-
+# Compare results if historical data is available
+if historical_runoff_mm is not None:
+    difference = runoff - historical_runoff_mm
+    print(f"Difference between SCS Runoff and Historical Runoff: {difference} mm")
+else:
+    print("Comparison skipped due to missing historical runoff data.")
