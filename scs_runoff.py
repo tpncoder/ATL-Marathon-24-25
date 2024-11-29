@@ -1,28 +1,32 @@
-import math
-
-def calculate_scs_runoff(mean_precipitation, curve_number):
+def calculate_scs_runoff(precipitation, curve_number):
     """
     Calculate runoff using the SCS Curve Number method.
 
     Args:
-        mean_precipitation (float): Total precipitation (P) in mm.
-        curve_number (float): Curve Number (CN).
+        precipitation (float): Precipitation in mm.
+        curve_number (float): Curve number (50-98 range).
 
     Returns:
-        float: Runoff (Q) in mm.
+        float: Runoff in mm.
     """
-    if curve_number < 0 or curve_number > 100:
-        raise ValueError("Curve Number (CN) must be between 0 and 100.")
+    # Potential maximum retention
+    s = 25400 / curve_number - 254
 
-    # Compute S
-    S = (25400 / curve_number) - 254  # Potential maximum retention (mm)
-    
-    # Compute initial abstraction (Ia)
-    I_a = 0.2 * S  # Initial abstraction (mm)
+    # Initial abstraction (adjusted)
+    ia = 0.02 * s
 
-    # Calculate runoff (Q)
-    if mean_precipitation <= I_a:
-        return 0  # No runoff occurs
+    # Debugging: print intermediate values
+    print(f"Precipitation (P): {precipitation:.2f} mm")
+    print(f"Curve Number (CN): {curve_number:.2f}")
+    print(f"Potential Maximum Retention (S): {s:.2f} mm")
+    print(f"Initial Abstraction (Ia): {ia:.2f} mm")
+
+    # Calculate runoff
+    if precipitation > ia:
+        runoff = ((precipitation - ia) ** 2) / (precipitation + 0.8 * s)
     else:
-        Q = ((mean_precipitation - I_a) ** 2) / (mean_precipitation - I_a + S)
-        return round(Q, 2)
+        runoff = 0
+
+    # Debugging: print runoff
+    print(f"Runoff (Q): {runoff:.2f} mm")
+    return runoff

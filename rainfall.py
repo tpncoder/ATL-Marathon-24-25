@@ -2,25 +2,39 @@ import ee
 
 def get_rainfall_data(latitude, longitude, radius, start_date, end_date):
     """
-    Fetch historical rainfall data for a specific region.
+    Fetch precipitation data for a specific date range and region.
 
     Args:
-        latitude (float): Latitude of the center point.
-        longitude (float): Longitude of the center point.
-        radius (int): Radius of the area in meters.
-        start_date (str): Start date in the format "YYYY-MM-DD".
-        end_date (str): End date in the format "YYYY-MM-DD".
+        latitude (float): Latitude of the region's center.
+        longitude (float): Longitude of the region's center.
+        radius (float): Radius (in meters) around the point.
+        start_date (str): Start date in 'YYYY-MM-DD' format.
+        end_date (str): End date in 'YYYY-MM-DD' format.
 
     Returns:
-        dict: Rainfall data statistics.
+        dict: Statistics of precipitation (total and mean) in mm.
     """
+    # Define the region of interest
     region = ee.Geometry.Point([longitude, latitude]).buffer(radius)
-    rainfall_dataset = ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY").filterDate(start_date, end_date)
-    rainfall_image = rainfall_dataset.sum()
-    stats = rainfall_image.reduceRegion(
-        reducer=ee.Reducer.mean(),
+
+    # Use GPM IMERG dataset (global precipitation data)
+    precipitation_dataset = ee.ImageCollection("NASA/GPM_L3/IMERG_V07").filterDate(start_date, end_date)
+
+    # Compute total precipitation over the period
+    total_precipitation = precipitation_dataset.select("precipitation").sum().clip(region)
+
+    # Calculate total and mean precipitation in the region
+    stats = total_precipitation.reduceRegion(
+        reducer=ee.Reducer.mean().combine(
+            ee.Reducer.sum(), sharedInputs=True
+        ),
         geometry=region,
-        scale=5000,
+        scale=1000,
         maxPixels=1e9
     ).getInfo()
-    return stats
+
+    # Return total and mean precipitation
+    return {
+        "total_precipitation": stats.get("precipitation_sum", None),
+        "mean_precipitation": stats.get("precipitation_mean", None)
+    }
