@@ -1,6 +1,7 @@
+import requests
 import ee
 import matplotlib.pyplot as plt
-from rainfall import get_rainfall_data
+from datetime import datetime, timedelta
 from scs_runoff import calculate_scs_runoff
 from coordinates import get_coordinates_from_ip
 
@@ -8,10 +9,19 @@ from coordinates import get_coordinates_from_ip
 ee.Authenticate()
 ee.Initialize(project="ee-floodbuddy")
 
-# Define parameters
 latitude, longitude = get_coordinates_from_ip()
 radius = 50000  # 50 km
-start_date, end_date = "2022-06-01", "2022-06-30"  # Example: June 2022
+api_key = "9a934c9a643a4edb92a123713243011"
+
+# Define date ranges for vegetation
+start_date, end_date = "2024-09-22", "2024-10-01"
+
+today = datetime.now()
+one_week_later = today + timedelta(weeks=1)
+
+# Format the dates as strings in the format 'YYYY-MM-DD'
+start_date_rainfall = today.strftime('%Y-%m-%d')
+end_date_rainfall = one_week_later.strftime('%Y-%m-%d')
 
 # Define region
 region = ee.Geometry.Point([longitude, latitude]).buffer(radius)
@@ -36,27 +46,34 @@ soil_texture = soil_data.reduceRegion(
 ).getInfo().get("b0", None)
 
 print("Fetching vegetation data...")
-vegetation = (
-    ee.ImageCollection("MODIS/061/MOD13A1")
-    .filterDate(start_date, end_date)
-    .mean()
-    .select("NDVI")
-    .clip(region)
-    .multiply(0.0001)
-    .clamp(-1, 1)
-)
+vegetation_collection = ee.ImageCollection("MODIS/061/MOD13A1").filterDate(start_date, end_date)
+if vegetation_collection.size().getInfo() == 0:
+    print("No vegetation data available for the selected date range.")
+    ndvi = 0  # Default value
+else:
+    vegetation = vegetation_collection.mean().select("NDVI").clip(region).multiply(0.0001).clamp(-1, 1)
+    ndvi = vegetation.reduceRegion(
+        reducer=ee.Reducer.mean(),
+        geometry=region,
+        scale=250,
+        maxPixels=1e9
+    ).getInfo().get("NDVI", 0)
 
-ndvi = vegetation.reduceRegion(
-    reducer=ee.Reducer.mean(),
-    geometry=region,
-    scale=250,
-    maxPixels=1e9
-).getInfo().get("NDVI", 0)
+# Fetch future rainfall prediction data using Weather API
+print("Fetching future rainfall prediction data...")
+url = f"https://api.open-meteo.com/v1/forecast?latitude={latitude}&longitude={longitude}&hourly=rain"
+response = requests.get(url)
+print(url)
 
-print("Fetching historical rainfall data...")
-rainfall_data = get_rainfall_data(latitude, longitude, radius, start_date, end_date)
-total_precipitation = rainfall_data.get("total_precipitation", 0)
-mean_precipitation = rainfall_data.get("mean_precipitation", 0)
+if response.status_code == 200:
+    data = response.json()
+    hourly_precipitation = data.get("hourly", {}).get("precipitation", [])
+    total_precipitation = sum(hourly_precipitation)
+    mean_precipitation = total_precipitation / len(hourly_precipitation) if hourly_precipitation else 0
+    print(f"Total Precipitation: {total_precipitation:.2f} mm")
+    print(f"Mean Precipitation: {mean_precipitation:.2f} mm")
+else:
+    print("Error fetching rainfall data.")
 
 # Calculate Curve Number
 if soil_texture and ndvi:
@@ -79,26 +96,8 @@ curve_number = max(50, min(curve_number, 98))  # Clamp
 # Calculate runoff
 runoff_predicted = calculate_scs_runoff(mean_precipitation, curve_number)
 
-# Fetch historical runoff data
-print("Fetching historical runoff data...")
-runoff_dataset = "NASA/GLDAS/V021/NOAH/G025/T3H"  # Check EE catalog for accuracy
-try:
-    runoff_data = ee.ImageCollection(runoff_dataset).filterDate(start_date, end_date).select("Qs_acc").mean()
-    historical_runoff = runoff_data.reduceRegion(
-        reducer=ee.Reducer.mean(),
-        geometry=region,
-        scale=1000,
-        maxPixels=1e9
-    ).getInfo().get("Qs_acc", None)
-
-    historical_runoff_mm = historical_runoff * 1000 if historical_runoff else None
-except ee.ee_exception.EEException as e:
-    print(f"Error fetching historical runoff data: {e}")
-    historical_runoff_mm = None
-
 # Print predicted runoff
-print(f"Predicted Runoff: {runoff_predicted:.2f} mm")
-print(f"Historical Runoff: {historical_runoff_mm:.2f}" if historical_runoff_mm else "No historical runoff data available")
+print(f"Predicted Runoff (Future): {runoff_predicted:.2f} mm")
 
 # Plotting the chart
 factors = ["Slope (°)", "NDVI", "Soil Texture", "Precipitation (mm)", "Runoff (mm)"]
@@ -106,7 +105,7 @@ values = [slope, ndvi, soil_texture or 0, mean_precipitation, runoff_predicted]
 
 plt.figure(figsize=(10, 6))
 plt.bar(factors, values, color=["blue", "green", "brown", "cyan", "orange"])
-plt.title("Factors and Predicted Runoff")
+plt.title("Factors and Predicted Runoff Based on Future Rainfall")
 plt.ylabel("Values")
 plt.xlabel("Factors")
 plt.show()
